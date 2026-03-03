@@ -248,6 +248,8 @@ def request_2fa_web(
 
     # wait for input
     while True:
+        if status_exchange.get_progress().cancel:
+            raise KeyboardInterrupt()
         status = status_exchange.get_status()
         if status == Status.NEED_MFA:
             time.sleep(1)

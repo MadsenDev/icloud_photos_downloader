@@ -21,6 +21,7 @@ from pyicloud_ipd.exceptions import PyiCloudAPIResponseException
 from pyicloud_ipd.services.photos import PhotoAlbum, PhotoAsset, PhotoLibrary
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 from tests.helpers import (
+    DEFAULT_ENV,
     calc_data_dir,
     create_files,
     path_from_project_root,
@@ -28,6 +29,7 @@ from tests.helpers import (
     recreate_path,
     run_cassette,
     run_icloudpd_test,
+    run_main_env,
 )
 
 
@@ -356,6 +358,7 @@ class DownloadPhotoTestCase(TestCase):
                             if (f[2] == "photo" and f[1].endswith(".MOV"))
                             else AssetVersionSize.ORIGINAL,
                             ANY,  # filename_builder
+                            refresh_version=ANY,
                         ),
                         files_to_download_ext,
                     )
@@ -892,6 +895,7 @@ class DownloadPhotoTestCase(TestCase):
                         ANY,
                         AssetVersionSize.THUMB,
                         ANY,  # filename_builder
+                        refresh_version=ANY,
                     )
 
                     assert result.exit_code == 0
@@ -1738,6 +1742,118 @@ class DownloadPhotoTestCase(TestCase):
 
                 self.assertEqual(result.exit_code, 1, "Exit Code")
 
+    def test_retry_metadata_throttling_then_success(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        data_dir = calc_data_dir(base_dir)
+        cookie_dir = os.path.join(base_dir, "cookie")
+        for directory in [base_dir, data_dir, cookie_dir]:
+            recreate_path(directory)
+
+        class FakeAlbum:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __iter__(self) -> Any:
+                if self.calls == 0:
+                    self.calls += 1
+                    raise PyiCloudAPIResponseException("Rate limited", "429")
+                return iter([])
+
+            def __len__(self) -> int:
+                return 0
+
+            def increment_offset(self, _count: int) -> None:
+                return None
+
+        class FakePhotos:
+            def __init__(self, album: FakeAlbum) -> None:
+                self.all = album
+                self.albums = {}
+                self.private_libraries = {"PrimarySync": self}
+                self.shared_libraries = {}
+
+        class FakeCloud:
+            def __init__(self, photos: FakePhotos) -> None:
+                self.photos = photos
+                self.response_observer = None
+
+        fake_album = FakeAlbum()
+        fake_cloud = FakeCloud(FakePhotos(fake_album))
+
+        with mock.patch("icloudpd.base.authenticator", return_value=fake_cloud):
+            result = print_result_exception(
+                run_main_env(
+                    DEFAULT_ENV,
+                    [
+                        "--username",
+                        "jdoe@gmail.com",
+                        "--password",
+                        "password1",
+                        "--directory",
+                        data_dir,
+                        "--cookie-directory",
+                        cookie_dir,
+                        "--skip-videos",
+                        "--skip-live-photos",
+                        "--no-progress-bar",
+                        "--max-retries",
+                        "1",
+                        "--backoff-base-seconds",
+                        "0.01",
+                        "--backoff-max-seconds",
+                        "0.01",
+                    ],
+                )
+            )
+
+            self.assertIn("Transient error (PyiCloudAPIResponseException). Retrying in", result.output)
+            self.assertIn("All photos have been downloaded", result.output)
+            self.assertEqual(result.exit_code, 0, "Exit Code")
+
+    def test_retry_download_503_then_success(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        original_download = PhotoAsset.download
+        calls = {"count": 0}
+
+        def flaky_download(photo: PhotoAsset, session: Any, url: str, start: int = 0) -> Any:
+            if calls["count"] == 0:
+                calls["count"] += 1
+                raise PyiCloudAPIResponseException("Service unavailable", "503")
+            return original_download(photo, session, url, start)
+
+        with mock.patch("time.sleep") as sleep_mock:  # noqa: SIM117
+            with mock.patch.object(PhotoAsset, "download", new=flaky_download):
+                _, result = run_icloudpd_test(
+                    self.assertEqual,
+                    self.root_path,
+                    base_dir,
+                    "listing_photos.yml",
+                    [],
+                    [("2018/07/31", "IMG_7409.JPG")],
+                    [
+                        "--username",
+                        "jdoe@gmail.com",
+                        "--password",
+                        "password1",
+                        "--recent",
+                        "1",
+                        "--skip-videos",
+                        "--skip-live-photos",
+                        "--no-progress-bar",
+                        "--max-retries",
+                        "1",
+                        "--backoff-base-seconds",
+                        "0.01",
+                        "--backoff-max-seconds",
+                        "0.01",
+                    ],
+                )
+
+                self.assertIn("Error downloading IMG_7409.JPG, retrying after", result.output)
+                self.assertIn("Downloaded", result.output)
+                self.assertEqual(sleep_mock.call_count, 1, "sleep count")
+                self.assertEqual(result.exit_code, 0, "Exit Code")
+
     def test_handle_io_error_mkdir(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
         original_makedirs = os.makedirs
@@ -2514,4 +2630,65 @@ class DownloadPhotoTestCase(TestCase):
         # check size
         photo_size = os.path.getsize(out_path)
 
-        self.assertEqual(617 + 1234, photo_size, "photo size")
+        self.assertEqual(617, photo_size, "photo size")
+
+    def test_no_remote_count_skips_album_length_call(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        files_to_download = [("2018/07/31", "IMG_7409.JPG")]
+
+        with mock.patch.object(PhotoAlbum, "__len__", side_effect=AssertionError("len should not be called")):
+            _data_dir, result = run_icloudpd_test(
+                self.assertEqual,
+                self.root_path,
+                base_dir,
+                "listing_photos.yml",
+                [],
+                files_to_download,
+                [
+                    "--username",
+                    "jdoe@gmail.com",
+                    "--password",
+                    "password1",
+                    "--recent",
+                    "1",
+                    "--skip-videos",
+                    "--skip-live-photos",
+                    "--no-remote-count",
+                    "--no-progress-bar",
+                    "--threads-num",
+                    "1",
+                ],
+            )
+            self.assertEqual(result.exit_code, 0)
+
+    def test_until_found_skips_album_length_call(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
+        files_to_download = []
+
+        with mock.patch.object(
+            PhotoAlbum, "__len__", side_effect=AssertionError("len should not be called")
+        ):
+            _data_dir, result = run_icloudpd_test(
+                self.assertEqual,
+                self.root_path,
+                base_dir,
+                "listing_photos.yml",
+                [],
+                files_to_download,
+                [
+                    "--username",
+                    "jdoe@gmail.com",
+                    "--password",
+                    "password1",
+                    "--until-found",
+                    "1",
+                    "--recent",
+                    "0",
+                    "--skip-videos",
+                    "--skip-live-photos",
+                    "--no-progress-bar",
+                    "--threads-num",
+                    "1",
+                ],
+            )
+            self.assertEqual(result.exit_code, 0)

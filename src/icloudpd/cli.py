@@ -12,6 +12,7 @@ from tzlocal import get_localzone
 import foundation
 from foundation.core import chain_from_iterable, compose, map_, partial_1_1, skip
 from foundation.string_utils import lower
+from icloudpd import constants
 from icloudpd.base import ensure_tzinfo, run_with_configs
 from icloudpd.config import GlobalConfig, UserConfig
 from icloudpd.log_level import LogLevel
@@ -22,6 +23,10 @@ from pyicloud_ipd.file_match import FileMatchPolicy
 from pyicloud_ipd.live_photo_mov_filename_policy import LivePhotoMovFilenamePolicy
 from pyicloud_ipd.raw_policy import RawTreatmentPolicy
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
+
+EXIT_SUCCESS = 0
+EXIT_RUNTIME_ERROR = 1
+EXIT_USAGE_ERROR = 2
 
 
 def map_align_raw_to_enum(align_raw_str: str) -> RawTreatmentPolicy:
@@ -252,9 +257,78 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         type=parse_timestamp_or_timedelta_tz_error,
     )
     cloned.add_argument(
+        "--skip-added-before",
+        help="Do not process assets added to iCloud before the specified timestamp in ISO format (2025-01-02) or interval backwards from now (20d = 20 days ago)",
+        default=None,
+        type=parse_timestamp_or_timedelta_tz_error,
+    )
+    cloned.add_argument(
+        "--skip-added-after",
+        help="Do not process assets added to iCloud after the specified timestamp in ISO format (2025-01-02) or interval backwards from now (20d = 20 days ago)",
+        default=None,
+        type=parse_timestamp_or_timedelta_tz_error,
+    )
+    cloned.add_argument(
         "--skip-photos",
         help="Don't download any photos (default: download all photos and videos)",
         action="store_true",
+    )
+    cloned.add_argument(
+        "--download-chunk-bytes",
+        help="Chunk size in bytes for streamed downloads. Default: %(default)s",
+        type=int,
+        default=262144,
+    )
+    cloned.add_argument(
+        "--download-workers",
+        help="Number of download worker slots. Metadata enumeration remains single-threaded. Default: %(default)s",
+        type=int,
+        default=4,
+    )
+    cloned.add_argument(
+        "--verify-size",
+        help="Validate downloaded file size against iCloud metadata (default: disabled)",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    cloned.add_argument(
+        "--verify-checksum",
+        help="Validate downloaded file checksum when metadata checksum is available (default: disabled)",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    cloned.add_argument(
+        "--album-page-size",
+        help="Album enumeration page size (results per request). Recommended range: 50-500. Default: %(default)s",
+        type=int,
+        default=100,
+    )
+    cloned.add_argument(
+        "--no-remote-count",
+        help="Skip remote album count lookups and run without known total progress",
+        action="store_true",
+        default=False,
+    )
+    cloned.add_argument(
+        "--state-db",
+        metavar="PATH",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Enable persistent state DB for resumable runs. If PATH is omitted, defaults to <cookie-directory>/icloudpd.sqlite",
+    )
+    cloned.add_argument(
+        "--state-db-prune-completed-days",
+        metavar="DAYS",
+        type=int,
+        default=None,
+        help="Delete completed/failed state DB tasks older than DAYS (run-end maintenance)",
+    )
+    cloned.add_argument(
+        "--state-db-vacuum",
+        help="Run VACUUM on state DB at run end (can be slow on large DBs)",
+        action="store_true",
+        default=False,
     )
     return cloned
 
@@ -315,6 +389,13 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         type=lower,
     )
     cloned.add_argument(
+        "--log-format",
+        help="Log output format. Default: %(default)s",
+        choices=["text", "json"],
+        default="text",
+        type=lower,
+    )
+    cloned.add_argument(
         "--no-progress-bar",
         help="Disable the one-line progress bar and print log messages on separate lines "
         "(progress bar is disabled by default if there is no TTY attached)",
@@ -325,7 +406,7 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         deprecated_kwargs["deprecated"] = True
     cloned.add_argument(
         "--threads-num",
-        help="Number of CPU threads - deprecated & always 1. To be removed in a future version",
+        help="Number of CPU threads - deprecated & always 1. Use --download-workers for download concurrency. To be removed in a future version",
         type=int,
         default=1,
         **deprecated_kwargs,
@@ -357,6 +438,42 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         choices=["console", "webui"],
         default="console",
         type=lower,
+    )
+    cloned.add_argument(
+        "--max-retries",
+        help="Maximum retry attempts for transient metadata and download failures. Default: %(default)s",
+        type=int,
+        default=constants.MAX_RETRIES,
+    )
+    cloned.add_argument(
+        "--backoff-base-seconds",
+        help="Base retry delay in seconds for exponential backoff. Default: %(default)s",
+        type=float,
+        default=5.0,
+    )
+    cloned.add_argument(
+        "--backoff-max-seconds",
+        help="Maximum retry delay in seconds. Default: %(default)s",
+        type=float,
+        default=300.0,
+    )
+    cloned.add_argument(
+        "--respect-retry-after",
+        help="Respect server Retry-After headers when available (default: enabled)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    cloned.add_argument(
+        "--throttle-cooldown-seconds",
+        help="Minimum cool-down delay in seconds for throttling errors. Default: %(default)s",
+        type=float,
+        default=60.0,
+    )
+    cloned.add_argument(
+        "--metrics-json",
+        help="Write run metrics as JSON to this path",
+        default=None,
+        type=str,
     )
     return cloned
 
@@ -471,7 +588,18 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         file_match_policy=FileMatchPolicy(user_ns.file_match_policy),
         skip_created_before=user_ns.skip_created_before,
         skip_created_after=user_ns.skip_created_after,
+        skip_added_before=user_ns.skip_added_before,
+        skip_added_after=user_ns.skip_added_after,
         skip_photos=user_ns.skip_photos,
+        download_chunk_bytes=user_ns.download_chunk_bytes,
+        download_workers=user_ns.download_workers,
+        verify_size=user_ns.verify_size,
+        verify_checksum=user_ns.verify_checksum,
+        album_page_size=user_ns.album_page_size,
+        no_remote_count=user_ns.no_remote_count,
+        state_db=user_ns.state_db,
+        state_db_prune_completed_days=user_ns.state_db_prune_completed_days,
+        state_db_vacuum=user_ns.state_db_vacuum,
     )
 
 
@@ -515,6 +643,7 @@ def parse(args: Sequence[str]) -> Tuple[GlobalConfig, Sequence[UserConfig]]:
             use_os_locale=global_ns.use_os_locale,
             only_print_filenames=global_ns.only_print_filenames,
             log_level=log_level(global_ns.log_level),
+            log_format=global_ns.log_format,
             no_progress_bar=global_ns.no_progress_bar,
             threads_num=global_ns.threads_num,
             domain=global_ns.domain,
@@ -528,6 +657,12 @@ def parse(args: Sequence[str]) -> Tuple[GlobalConfig, Sequence[UserConfig]]:
                 )
             ),
             mfa_provider=MFAProvider(global_ns.mfa_provider),
+            max_retries=global_ns.max_retries,
+            backoff_base_seconds=global_ns.backoff_base_seconds,
+            backoff_max_seconds=global_ns.backoff_max_seconds,
+            respect_retry_after=global_ns.respect_retry_after,
+            throttle_cooldown_seconds=global_ns.throttle_cooldown_seconds,
+            metrics_json=global_ns.metrics_json,
         ),
         user_nses,
     )
@@ -538,7 +673,7 @@ def cli() -> int:
         global_ns, user_nses = parse(sys.argv[1:])
     except argparse.ArgumentError as error:
         print(error)
-        return 2
+        return EXIT_USAGE_ERROR
     if global_ns.use_os_locale:
         from locale import LC_ALL, setlocale
 
@@ -547,17 +682,17 @@ def cli() -> int:
         pass
     if global_ns.help:
         print(format_help())
-        return 0
+        return EXIT_SUCCESS
     elif global_ns.version:
         print(foundation.version_info_formatted())
-        return 0
+        return EXIT_SUCCESS
     else:
         # check param compatibility
         if [user_ns for user_ns in user_nses if user_ns.skip_videos and user_ns.skip_photos]:
             print(
                 "Only one of --skip-videos and --skip-photos can be used at a time for each configuration"
             )
-            return 2
+            return EXIT_USAGE_ERROR
 
         # check required directory param only if not list albums
         elif [
@@ -571,7 +706,31 @@ def cli() -> int:
             print(
                 "--auth-only, --directory, --list-libraries, or --list-albums are required for each configuration"
             )
-            return 2
+            return EXIT_USAGE_ERROR
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if user_ns.directory is not None and not pathlib.Path(user_ns.directory).exists()
+        ]:
+            print("Directory specified in --directory does not exist")
+            return EXIT_USAGE_ERROR
+        elif [user_ns for user_ns in user_nses if user_ns.download_chunk_bytes <= 0]:
+            print("--download-chunk-bytes must be greater than 0")
+            return EXIT_USAGE_ERROR
+        elif [user_ns for user_ns in user_nses if user_ns.download_workers <= 0]:
+            print("--download-workers must be greater than 0")
+            return EXIT_USAGE_ERROR
+        elif [user_ns for user_ns in user_nses if user_ns.album_page_size < 1]:
+            print("--album-page-size must be greater than 0")
+            return EXIT_USAGE_ERROR
+        elif [
+            user_ns
+            for user_ns in user_nses
+            if user_ns.state_db_prune_completed_days is not None
+            and user_ns.state_db_prune_completed_days <= 0
+        ]:
+            print("--state-db-prune-completed-days must be greater than 0")
+            return EXIT_USAGE_ERROR
 
         elif [
             user_ns
@@ -581,7 +740,7 @@ def cli() -> int:
             print(
                 "--auto-delete and --delete-after-download are mutually exclusive per configuration"
             )
-            return 2
+            return EXIT_USAGE_ERROR
 
         elif [
             user_ns
@@ -591,7 +750,7 @@ def cli() -> int:
             print(
                 "--keep-icloud-recent-days and --delete-after-download should not be used together in one configuration"
             )
-            return 2
+            return EXIT_USAGE_ERROR
 
         elif global_ns.watch_with_interval and (
             [
@@ -604,7 +763,22 @@ def cli() -> int:
             print(
                 "--watch-with-interval is not compatible with --list-albums, --list-libraries, --only-print-filenames, and --auth-only"
             )
-            return 2
+            return EXIT_USAGE_ERROR
+        elif global_ns.max_retries < 0:
+            print("--max-retries must be 0 or greater")
+            return EXIT_USAGE_ERROR
+        elif global_ns.backoff_base_seconds <= 0:
+            print("--backoff-base-seconds must be greater than 0")
+            return EXIT_USAGE_ERROR
+        elif global_ns.backoff_max_seconds <= 0:
+            print("--backoff-max-seconds must be greater than 0")
+            return EXIT_USAGE_ERROR
+        elif global_ns.backoff_max_seconds < global_ns.backoff_base_seconds:
+            print("--backoff-max-seconds must be greater than or equal to --backoff-base-seconds")
+            return EXIT_USAGE_ERROR
+        elif global_ns.throttle_cooldown_seconds < 0:
+            print("--throttle-cooldown-seconds must be 0 or greater")
+            return EXIT_USAGE_ERROR
         else:
             return run_with_configs(global_ns, user_nses)
 

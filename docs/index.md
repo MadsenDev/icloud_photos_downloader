@@ -12,7 +12,13 @@ A command-line tool to download your iCloud photos to local storage
 install
 authentication
 naming
+architecture
 mode
+migration
+concurrency
+troubleshooting
+benchmark_download_workers
+benchmark_download_chunks
 size
 raw
 webui

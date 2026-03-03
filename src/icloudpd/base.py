@@ -7,15 +7,18 @@ import itertools
 import json
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
 import typing
 import urllib
+import uuid
 from functools import partial, singledispatch
 from logging import Logger
 from multiprocessing import freeze_support
-from threading import Thread
+from threading import Event, Thread, current_thread, main_thread
 from typing import (
     Any,
     Callable,
@@ -45,15 +48,42 @@ from icloudpd.config import GlobalConfig, UserConfig
 from icloudpd.counter import Counter
 from icloudpd.email_notifications import send_2sa_notification
 from icloudpd.filename_policies import build_filename_with_policies, create_filename_builder
+from icloudpd.limiter import AdaptiveDownloadLimiter
 from icloudpd.log_level import LogLevel
+from icloudpd.metrics import RunMetrics, write_metrics_json
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.password_provider import PasswordProvider
 from icloudpd.paths import local_download_path, remove_unicode_chars
+from icloudpd.retry_utils import (
+    RetryConfig,
+    is_fatal_auth_config_error,
+    is_throttle_error,
+    is_transient_error,
+)
 from icloudpd.server import serve_app
+from icloudpd.state_db import (
+    checkpoint_wal,
+    clear_asset_tasks_need_url_refresh,
+    initialize_state_db,
+    load_checkpoint,
+    mark_asset_tasks_need_url_refresh,
+    prune_completed_tasks,
+    record_asset_checksum_result,
+    requeue_in_progress_tasks,
+    requeue_stale_leases,
+    resolve_state_db_path,
+    save_checkpoint,
+    upsert_asset_tasks,
+    vacuum_state_db,
+)
 from icloudpd.status import Status, StatusExchange
 from icloudpd.string_helpers import parse_timestamp_or_timedelta, truncate_middle
 from icloudpd.xmp_sidecar import generate_xmp_file
-from pyicloud_ipd.asset_version import add_suffix_to_filename, calculate_version_filename
+from pyicloud_ipd.asset_version import (
+    AssetVersion,
+    add_suffix_to_filename,
+    calculate_version_filename,
+)
 from pyicloud_ipd.base import PyiCloudService
 from pyicloud_ipd.exceptions import (
     PyiCloudAPIResponseException,
@@ -81,6 +111,78 @@ from pyicloud_ipd.utils import (
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 
 freeze_support()  # fmt: skip # fixing tqdm on macos
+EXIT_CANCELLED = 130
+ENGINE_MODE_LEGACY_STATELESS = "legacy_stateless"
+ENGINE_MODE_STATEFUL = "stateful_engine"
+THROTTLE_ALERT_THRESHOLD = 5
+
+
+def determine_engine_mode(state_db_path: str | None) -> str:
+    return ENGINE_MODE_STATEFUL if state_db_path else ENGINE_MODE_LEGACY_STATELESS
+
+
+def emit_throttle_alert_if_needed(
+    logger: logging.Logger,
+    run_metrics: RunMetrics,
+    threshold: int = THROTTLE_ALERT_THRESHOLD,
+) -> bool:
+    if run_metrics.throttle_events < threshold:
+        return False
+    logger.warning(
+        "Repeated throttling detected for user %s (%d events). Consider lowering --download-workers, increasing --watch-with-interval, and keeping --no-remote-count enabled.",
+        run_metrics.username,
+        run_metrics.throttle_events,
+    )
+    return True
+
+
+class ShutdownController:
+    def __init__(self, status_exchange: StatusExchange):
+        self._status_exchange = status_exchange
+        self._event = Event()
+        self._signal_name: str | None = None
+        self._installed = False
+        self._previous_handlers: dict[int, typing.Any] = {}
+
+    def install(self) -> None:
+        if self._installed or current_thread() is not main_thread():
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self._previous_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, self._build_handler(sig))
+        self._installed = True
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        for sig, previous in self._previous_handlers.items():
+            signal.signal(sig, previous)
+        self._previous_handlers.clear()
+        self._installed = False
+
+    def _build_handler(self, sig: int) -> Callable[[int, typing.Any], None]:
+        def handler(_signum: int, _frame: typing.Any) -> None:
+            self._signal_name = signal.Signals(sig).name
+            self._event.set()
+            self._status_exchange.get_progress().cancel = True
+
+        return handler
+
+    def request_stop(self, reason: str | None = None) -> None:
+        self._signal_name = reason or self._signal_name
+        self._event.set()
+        self._status_exchange.get_progress().cancel = True
+
+    def requested(self) -> bool:
+        return self._event.is_set() or self._status_exchange.get_progress().cancel
+
+    def signal_name(self) -> str | None:
+        return self._signal_name
+
+    def sleep_or_stop(self, seconds: float) -> bool:
+        if seconds <= 0:
+            return not self.requested()
+        return not self._event.wait(timeout=seconds)
 
 
 def build_filename_cleaner(keep_unicode: bool) -> Callable[[str], str]:
@@ -138,6 +240,10 @@ def get_password_from_webui(
 
     # wait for input
     while True:
+        if status_exchange.get_progress().cancel:
+            logger.info("Password input cancelled")
+            status_exchange.replace_status(Status.NEED_PASSWORD, Status.NO_INPUT_NEEDED)
+            return None
         status = status_exchange.get_status()
         if status == Status.NEED_PASSWORD:
             time.sleep(1)
@@ -209,12 +315,81 @@ def ensure_tzinfo(tz: datetime.tzinfo, input: datetime.datetime) -> datetime.dat
 
 
 def create_logger(config: GlobalConfig) -> logging.Logger:
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
-    )
     logger = logging.getLogger("icloudpd")
+    logger.handlers.clear()
+    logger.propagate = True
+
+    class RunContextFilter(logging.Filter):
+        def __init__(self, run_id: str):
+            super().__init__()
+            self._run_id = run_id
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            if not hasattr(record, "run_id"):
+                record.run_id = self._run_id  # type: ignore[attr-defined]
+            if not hasattr(record, "asset_id"):
+                record.asset_id = None  # type: ignore[attr-defined]
+            if not hasattr(record, "attempt"):
+                record.attempt = None  # type: ignore[attr-defined]
+            if not hasattr(record, "http_status"):
+                record.http_status = None  # type: ignore[attr-defined]
+            return True
+
+    class SensitiveDataRedactionFilter(logging.Filter):
+        _KEY_VALUE_PATTERNS = [
+            # JSON payload style: "password": "value"
+            re.compile(
+                r'(?i)"(password|passphrase|session_token|trust_token|token|authorization|cookie|scnt)"\s*:\s*"([^"]+)"'
+            ),
+            # key=value style in plain logs
+            re.compile(
+                r"(?i)\b(password|passphrase|session_token|trust_token|token|authorization|cookie|scnt)\b\s*[:=]\s*(Bearer\s+[^\s,;]+|[^\s,;]+)"
+            ),
+            # Authorization bearer tokens
+            re.compile(r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*"),
+        ]
+
+        def _redact(self, message: str) -> str:
+            redacted = message
+            redacted = self._KEY_VALUE_PATTERNS[0].sub(r'"\1":"REDACTED"', redacted)
+            redacted = self._KEY_VALUE_PATTERNS[1].sub(r"\1=REDACTED", redacted)
+            redacted = self._KEY_VALUE_PATTERNS[2].sub("Bearer REDACTED", redacted)
+            return redacted
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            redacted = self._redact(record.getMessage())
+            record.msg = redacted
+            record.args = ()  # type: ignore[assignment]
+            return True
+
+    class JsonLogFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            payload = {
+                "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+                "run_id": getattr(record, "run_id", None),
+                "asset_id": getattr(record, "asset_id", None),
+                "attempt": getattr(record, "attempt", None),
+                "http_status": getattr(record, "http_status", None),
+            }
+            return json.dumps(payload, ensure_ascii=True)
+
+    handler = logging.StreamHandler(sys.stdout)
+    if config.log_format == "json":
+        handler.setFormatter(JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)-8s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+    logger.addHandler(handler)
+    logger.addFilter(RunContextFilter(uuid.uuid4().hex))
+    logger.addFilter(SensitiveDataRedactionFilter())
+
     if config.only_print_filenames:
         logger.disabled = True
     else:
@@ -241,6 +416,8 @@ def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserCon
 
     # Create shared status exchange for web server and progress tracking
     shared_status_exchange = StatusExchange()
+    shutdown = ShutdownController(shared_status_exchange)
+    shutdown.install()
 
     # Check if any user needs web server (webui for MFA or passwords)
     needs_web_server = global_config.mfa_provider == MFAProvider.WEBUI or any(
@@ -258,7 +435,16 @@ def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserCon
 
     if not watch_interval:
         # No watch mode - process each user once and exit
-        return _process_all_users_once(global_config, user_configs, logger, shared_status_exchange)
+        try:
+            return _process_all_users_once(
+                global_config,
+                user_configs,
+                logger,
+                shared_status_exchange,
+                shutdown,
+            )
+        finally:
+            shutdown.restore()
     else:
         # Watch mode - infinite loop processing all users, then wait
         skip_bar = not os.environ.get("FORCE_TQDM") and (
@@ -267,46 +453,63 @@ def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserCon
             or not sys.stdout.isatty()
         )
 
-        while True:
-            # Process all user configs in this iteration
-            result = _process_all_users_once(
-                global_config, user_configs, logger, shared_status_exchange
-            )
+        try:
+            while True:
+                if shutdown.requested():
+                    signal_name = shutdown.signal_name() or "cancellation signal"
+                    logger.info("Run cancelled by %s", signal_name)
+                    return EXIT_CANCELLED
 
-            # If any critical operation (auth-only, list commands) succeeded, exit
-            if result == 0:
-                first_user = user_configs[0] if user_configs else None
-                if first_user and (
-                    first_user.auth_only or first_user.list_albums or first_user.list_libraries
-                ):
-                    return 0
-
-            # Wait for the watch interval before next iteration
-            # Clear current user during wait period to avoid misleading UI
-            shared_status_exchange.clear_current_user()
-            logger.info(f"Waiting for {watch_interval} sec...")
-            interval: Sequence[int] = range(1, watch_interval)
-            iterable: Sequence[int] = (
-                interval
-                if skip_bar
-                else typing.cast(
-                    Sequence[int],
-                    tqdm(
-                        iterable=interval,
-                        desc="Waiting...",
-                        ascii=True,
-                        leave=False,
-                        dynamic_ncols=True,
-                    ),
+                # Process all user configs in this iteration
+                result = _process_all_users_once(
+                    global_config,
+                    user_configs,
+                    logger,
+                    shared_status_exchange,
+                    shutdown,
                 )
-            )
-            for counter in iterable:
-                # Update shared status exchange with wait progress
-                shared_status_exchange.get_progress().waiting = watch_interval - counter
-                if shared_status_exchange.get_progress().resume:
-                    shared_status_exchange.get_progress().reset()
-                    break
-                time.sleep(1)
+                if result == EXIT_CANCELLED:
+                    return EXIT_CANCELLED
+
+                # If any critical operation (auth-only, list commands) succeeded, exit
+                if result == 0:
+                    first_user = user_configs[0] if user_configs else None
+                    if first_user and (
+                        first_user.auth_only or first_user.list_albums or first_user.list_libraries
+                    ):
+                        return 0
+
+                # Wait for the watch interval before next iteration
+                # Clear current user during wait period to avoid misleading UI
+                shared_status_exchange.clear_current_user()
+                logger.info(f"Waiting for {watch_interval} sec...")
+                interval: Sequence[int] = range(1, watch_interval)
+                iterable: Sequence[int] = (
+                    interval
+                    if skip_bar
+                    else typing.cast(
+                        Sequence[int],
+                        tqdm(
+                            iterable=interval,
+                            desc="Waiting...",
+                            ascii=True,
+                            leave=False,
+                            dynamic_ncols=True,
+                        ),
+                    )
+                )
+                for counter in iterable:
+                    # Update shared status exchange with wait progress
+                    shared_status_exchange.get_progress().waiting = watch_interval - counter
+                    if shared_status_exchange.get_progress().resume:
+                        shared_status_exchange.get_progress().reset()
+                        break
+                    if not shutdown.sleep_or_stop(1):
+                        signal_name = shutdown.signal_name() or "cancellation signal"
+                        logger.info("Run cancelled by %s", signal_name)
+                        return EXIT_CANCELLED
+        finally:
+            shutdown.restore()
 
 
 def _process_all_users_once(
@@ -314,14 +517,54 @@ def _process_all_users_once(
     user_configs: Sequence[UserConfig],
     logger: logging.Logger,
     shared_status_exchange: StatusExchange,
+    shutdown: ShutdownController,
 ) -> int:
     """Process all user configs once (used by both single run and watch mode)"""
 
     # Set global config and all user configs to status exchange once, before processing
     shared_status_exchange.set_global_config(global_config)
     shared_status_exchange.set_user_configs(user_configs)
+    user_metrics_snapshots: list[dict[str, float | int | str]] = []
+
+    def write_run_summary(exit_code: int) -> None:
+        if not global_config.metrics_json:
+            return
+        users_with_failures = 0
+        for user in user_metrics_snapshots:
+            failed = user.get("downloads_failed", 0)
+            if isinstance(failed, int) and failed > 0:
+                users_with_failures += 1
+        if exit_code == 0 and users_with_failures > 0:
+            status = "partial_success"
+        elif exit_code == 0:
+            status = "success"
+        elif exit_code == EXIT_CANCELLED:
+            status = "cancelled"
+        elif exit_code == 2:
+            status = "cli_error"
+        else:
+            status = "runtime_error"
+        write_metrics_json(
+            global_config.metrics_json,
+            {
+                "exit_code": exit_code,
+                "status": status,
+                "users_total": len(user_metrics_snapshots),
+                "users_with_failures": users_with_failures,
+                "users": user_metrics_snapshots,
+            },
+        )
+
+    if shutdown.requested():
+        write_run_summary(EXIT_CANCELLED)
+        return EXIT_CANCELLED
 
     for user_config in user_configs:
+        if shutdown.requested():
+            signal_name = shutdown.signal_name() or "cancellation signal"
+            logger.info("Stopping before user %s due to %s", user_config.username, signal_name)
+            write_run_summary(EXIT_CANCELLED)
+            return EXIT_CANCELLED
         with logging_redirect_tqdm():
             # Use shared status exchange instead of creating new ones per user
             status_exchange = shared_status_exchange
@@ -386,12 +629,52 @@ def _process_all_users_once(
             )
 
             # Set up function builders
+            state_db_path = resolve_state_db_path(user_config.state_db, user_config.cookie_directory)
+            engine_mode = determine_engine_mode(state_db_path)
+            if state_db_path:
+                logger.info("Initializing state DB at %s", state_db_path)
+                initialize_state_db(state_db_path)
+                logger.info(
+                    "Engine mode: %s (persistent task/checkpoint state enabled)",
+                    engine_mode,
+                )
+            else:
+                logger.info(
+                    "Engine mode: %s (filesystem skip semantics, no state DB required)",
+                    engine_mode,
+                )
+
+            download.set_retry_config(
+                RetryConfig(
+                    max_retries=global_config.max_retries,
+                    backoff_base_seconds=global_config.backoff_base_seconds,
+                    backoff_max_seconds=global_config.backoff_max_seconds,
+                    respect_retry_after=global_config.respect_retry_after,
+                    throttle_cooldown_seconds=global_config.throttle_cooldown_seconds,
+                )
+            )
+            download.set_download_chunk_bytes(user_config.download_chunk_bytes)
+            download.set_download_verification(
+                verify_size=user_config.verify_size,
+                verify_checksum=user_config.verify_checksum,
+            )
+            download.set_download_limiter(
+                AdaptiveDownloadLimiter(
+                    max_workers=user_config.download_workers,
+                    cooldown_seconds=global_config.throttle_cooldown_seconds,
+                )
+            )
+            run_metrics = RunMetrics(username=user_config.username, run_mode=engine_mode)
+            run_metrics.start()
+            download.set_metrics_collector(run_metrics)
             passer = partial(
                 where_builder,
                 logger,
                 user_config.skip_videos,
                 user_config.skip_created_before,
                 user_config.skip_created_after,
+                user_config.skip_added_before,
+                user_config.skip_added_after,
                 user_config.skip_photos,
                 filename_builder,
             )
@@ -440,16 +723,34 @@ def _process_all_users_once(
                 status_exchange,
                 global_config,
                 user_config,
+                shutdown,
                 password_providers_dict,
+                run_metrics,
                 passer,
                 downloader,
                 notificator,
                 lp_filename_generator,
             )
+            if state_db_path:
+                if user_config.state_db_prune_completed_days is not None:
+                    pruned = prune_completed_tasks(
+                        state_db_path,
+                        older_than_days=user_config.state_db_prune_completed_days,
+                    )
+                    if pruned > 0:
+                        logger.info("Pruned %d completed/failed state DB task(s)", pruned)
+                checkpoint_wal(state_db_path, mode="PASSIVE")
+                if user_config.state_db_vacuum:
+                    logger.info("Running state DB VACUUM at %s", state_db_path)
+                    vacuum_state_db(state_db_path)
+            run_metrics.finish()
+            emit_throttle_alert_if_needed(logger, run_metrics)
+            user_metrics_snapshots.append(run_metrics.snapshot())
 
             # If any user config fails and we're not in watch mode, return the error code
             if result != 0:
                 if not global_config.watch_with_interval:
+                    write_run_summary(result)
                     return result
                 else:
                     # In watch mode, log error and continue with next user
@@ -457,6 +758,7 @@ def _process_all_users_once(
                         f"Error processing user {user_config.username}, continuing with next user..."
                     )
 
+    write_run_summary(0)
     return 0
 
 
@@ -517,6 +819,8 @@ def where_builder(
     skip_videos: bool,
     skip_created_before: datetime.datetime | datetime.timedelta | None,
     skip_created_after: datetime.datetime | datetime.timedelta | None,
+    skip_added_before: datetime.datetime | datetime.timedelta | None,
+    skip_added_after: datetime.datetime | datetime.timedelta | None,
     skip_photos: bool,
     filename_builder: Callable[[PhotoAsset], str],
     photo: PhotoAsset,
@@ -540,6 +844,26 @@ def where_builder(
             logger.debug(skip_created_after_message(temp_created_after, photo, filename_builder))
             return False
 
+    if skip_added_before is not None:
+        temp_added_before = offset_to_datetime(skip_added_before)
+        try:
+            added_date = photo.added_date.astimezone(get_localzone())
+        except (KeyError, TypeError, ValueError, OSError):
+            added_date = None
+        if added_date is not None and added_date < temp_added_before:
+            logger.debug(skip_added_before_message(temp_added_before, photo, filename_builder))
+            return False
+
+    if skip_added_after is not None:
+        temp_added_after = offset_to_datetime(skip_added_after)
+        try:
+            added_date = photo.added_date.astimezone(get_localzone())
+        except (KeyError, TypeError, ValueError, OSError):
+            added_date = None
+        if added_date is not None and added_date > temp_added_after:
+            logger.debug(skip_added_after_message(temp_added_after, photo, filename_builder))
+            return False
+
     return True
 
 
@@ -559,6 +883,24 @@ def skip_created_after_message(
 ) -> str:
     filename = filename_builder(photo)
     return f"Skipping {filename}, as it was created {photo.created}, after {target_created_date}."
+
+
+def skip_added_before_message(
+    target_added_date: datetime.datetime,
+    photo: PhotoAsset,
+    filename_builder: Callable[[PhotoAsset], str],
+) -> str:
+    filename = filename_builder(photo)
+    return f"Skipping {filename}, as it was added {photo.added_date}, before {target_added_date}."
+
+
+def skip_added_after_message(
+    target_added_date: datetime.datetime,
+    photo: PhotoAsset,
+    filename_builder: Callable[[PhotoAsset], str],
+) -> str:
+    filename = filename_builder(photo)
+    return f"Skipping {filename}, as it was added {photo.added_date}, after {target_added_date}."
 
 
 def download_builder(
@@ -634,6 +976,13 @@ def download_builder(
     download_dir = os.path.normpath(os.path.join(directory, date_path))
     success = False
 
+    def refresh_asset_version(target_size: AssetVersionSize | LivePhotoVersionSize) -> AssetVersion | None:
+        # Drop cached versions and rebuild from latest asset metadata snapshot.
+        if hasattr(photo, "_versions"):
+            photo._versions = None  # type: ignore[attr-defined]
+        refreshed_versions = photo.versions_with_raw_policy(raw_policy)
+        return refreshed_versions.get(target_size)
+
     for download_size in primary_sizes:
         if download_size not in versions and download_size != AssetVersionSize.ORIGINAL:
             if force_size:
@@ -700,6 +1049,7 @@ def download_builder(
                     version,
                     download_size,
                     filename_builder,
+                    refresh_version=partial(refresh_asset_version, download_size),
                 )
                 success = download_result
 
@@ -798,6 +1148,7 @@ def download_builder(
                         version,
                         lp_size,
                         filename_builder,
+                        refresh_version=partial(refresh_asset_version, lp_size),
                     )
                     success = download_result and success
                     if download_result:
@@ -877,9 +1228,11 @@ def core_single_run(
     status_exchange: StatusExchange,
     global_config: GlobalConfig,
     user_config: UserConfig,
+    shutdown: ShutdownController,
     password_providers_dict: Dict[
         PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
     ],
+    run_metrics: RunMetrics,
     passer: Callable[[PhotoAsset], bool],
     downloader: Callable[[PyiCloudService, Counter, PhotoAsset], bool],
     notificator: Callable[[], None],
@@ -892,7 +1245,23 @@ def core_single_run(
         or global_config.no_progress_bar
         or not sys.stdout.isatty()
     )
+    retry_config = RetryConfig(
+        max_retries=global_config.max_retries,
+        backoff_base_seconds=global_config.backoff_base_seconds,
+        backoff_max_seconds=global_config.backoff_max_seconds,
+        respect_retry_after=global_config.respect_retry_after,
+        throttle_cooldown_seconds=global_config.throttle_cooldown_seconds,
+    )
+    state_db_path = resolve_state_db_path(user_config.state_db, user_config.cookie_directory)
+    retry_count = 0
+    stale_requeue_done = False
     while True:  # retry loop (not watch - only for immediate retries)
+        if shutdown.requested():
+            if state_db_path:
+                requeue_in_progress_tasks(state_db_path)
+            signal_name = shutdown.signal_name() or "cancellation signal"
+            logger.info("Run cancelled before authentication due to %s", signal_name)
+            return EXIT_CANCELLED
         captured_responses: List[Mapping[str, Any]] = []
 
         def append_response(captured: List[Mapping[str, Any]], response: Mapping[str, Any]) -> None:
@@ -973,21 +1342,50 @@ def core_single_run(
                         album_phrase = f" from albums {','.join(user_config.albums)}"
 
                     logger.debug(f"Looking up all {photo_video_phrase}{album_phrase}...")
+                    if state_db_path and not stale_requeue_done:
+                        requeued = requeue_stale_leases(state_db_path)
+                        stale_requeue_done = True
+                        if requeued > 0:
+                            logger.info("Requeued %d stale in-progress task(s) from prior run", requeued)
 
                     albums: Iterable[PhotoAlbum] = (
                         list(map_(library_object.albums.__getitem__, user_config.albums))
                         if len(user_config.albums) > 0
                         else [library_object.all]
                     )
-                    album_lengths: Callable[[Iterable[PhotoAlbum]], Iterable[int]] = partial_1_1(
-                        map_, len
+                    for album in albums:
+                        album.page_size = user_config.album_page_size
+
+                    should_fetch_remote_count = (
+                        not user_config.no_remote_count
+                        and user_config.until_found is None
                     )
+                    if not should_fetch_remote_count:
+                        photos_count = None
+                    else:
+                        album_lengths: Callable[[Iterable[PhotoAlbum]], Iterable[int]] = partial_1_1(
+                            map_, len
+                        )
 
-                    def sum_(inp: Iterable[int]) -> int:
-                        return sum(inp)
+                        def sum_(inp: Iterable[int]) -> int:
+                            return sum(inp)
 
-                    photos_count: int | None = compose(sum_, album_lengths)(albums)
+                        photos_count = compose(sum_, album_lengths)(albums)
                     for photo_album in albums:
+                        album_name = str(photo_album)
+                        library_name = user_config.library
+                        if state_db_path:
+                            checkpoint = load_checkpoint(
+                                state_db_path, library=library_name, album=album_name
+                            )
+                            if checkpoint is not None:
+                                logger.debug(
+                                    "Resuming album %s from checkpoint offset %d",
+                                    album_name,
+                                    checkpoint,
+                                )
+                                photo_album.offset = checkpoint
+
                         photos_enumerator: Iterable[PhotoAsset] = photo_album
 
                         # Optional: Only download the x most recent photos.
@@ -1070,7 +1468,10 @@ def core_single_run(
                         download_photo = partial(downloader, icloud)
 
                         for item in photos_bar:
+                            if shutdown.requested():
+                                break
                             try:
+                                run_metrics.on_asset_considered()
                                 if should_break(consecutive_files_found):
                                     logger.info(
                                         "Found %s consecutive previously downloaded photos. Exiting",
@@ -1080,10 +1481,51 @@ def core_single_run(
                                 # item = next(photos_iterator)
                                 should_delete = False
 
+                                if state_db_path:
+                                    upsert_asset_tasks(
+                                        state_db_path,
+                                        photo=item,
+                                        library=library_name,
+                                        album=album_name,
+                                    )
+                                    save_checkpoint(
+                                        state_db_path,
+                                        library=library_name,
+                                        album=album_name,
+                                        start_rank=int(photo_album.offset),
+                                    )
+
                                 passer_result = passer(item)
                                 download_result = passer_result and download_photo(
                                     consecutive_files_found, item
                                 )
+                                url_refresh_needed = download.consume_url_refresh_needed_signal()
+                                if state_db_path and passer_result and url_refresh_needed:
+                                    mark_asset_tasks_need_url_refresh(
+                                        state_db_path,
+                                        asset_id=item.id,
+                                        library=library_name,
+                                        album=album_name,
+                                    )
+                                elif state_db_path and passer_result and download_result:
+                                    clear_asset_tasks_need_url_refresh(
+                                        state_db_path,
+                                        asset_id=item.id,
+                                        library=library_name,
+                                        album=album_name,
+                                    )
+                                if state_db_path and passer_result and download_result:
+                                    record_asset_checksum_result(
+                                        state_db_path,
+                                        asset_id=item.id,
+                                        library=library_name,
+                                        album=album_name,
+                                        checksum_result=(
+                                            "verified"
+                                            if user_config.verify_checksum
+                                            else "not_checked"
+                                        ),
+                                    )
                                 if download_result and user_config.delete_after_download:
                                     should_delete = True
 
@@ -1144,6 +1586,8 @@ def core_single_run(
 
                                 photos_counter += 1
                                 status_exchange.get_progress().photos_counter = photos_counter
+                                if photos_count is not None:
+                                    run_metrics.set_queue_depth(photos_count - photos_counter)
 
                                 if status_exchange.get_progress().cancel:
                                     break
@@ -1157,10 +1601,15 @@ def core_single_run(
                             pass
 
                         if status_exchange.get_progress().cancel:
-                            logger.info("Iteration was cancelled")
+                            if state_db_path:
+                                requeue_in_progress_tasks(state_db_path)
+                            signal_name = shutdown.signal_name() or "cancellation signal"
+                            logger.info("Iteration was cancelled by %s", signal_name)
                             status_exchange.get_progress().photos_last_message = (
                                 "Iteration was cancelled"
                             )
+                            status_exchange.get_progress().reset()
+                            return EXIT_CANCELLED
                         else:
                             if user_config.skip_photos or user_config.skip_videos:
                                 photo_video_phrase = (
@@ -1207,6 +1656,10 @@ def core_single_run(
             PyiCloudServiceUnavailableException,
             PyiCloudAPIResponseException,
             PyiCloudConnectionErrorException,
+            ChunkedEncodingError,
+            ContentDecodingError,
+            StreamConsumedError,
+            UnrewindableBodyError,
         ) as error:
             logger.info(error)
             dump_responses(logger.debug, captured_responses)
@@ -1222,18 +1675,36 @@ def core_single_run(
                     pass
             else:
                 pass
+            if is_fatal_auth_config_error(error):
+                return 1
+            if is_transient_error(error) and retry_count < retry_config.max_retries:
+                retry_count += 1
+                wait_seconds = retry_config.next_delay_seconds(
+                    retry_count,
+                    throttle_error=is_throttle_error(error),
+                )
+                logger.info(
+                    "Transient error (%s). Retrying in %.1f seconds (%d/%d)...",
+                    type(error).__name__,
+                    wait_seconds,
+                    retry_count,
+                    retry_config.max_retries,
+                )
+                if not shutdown.sleep_or_stop(wait_seconds):
+                    if state_db_path:
+                        requeue_in_progress_tasks(state_db_path)
+                    signal_name = shutdown.signal_name() or "cancellation signal"
+                    logger.info("Run cancelled during retry backoff by %s", signal_name)
+                    return EXIT_CANCELLED
+                continue
             # In single run mode, return error after webui retry attempts
             return 1
-        except (
-            ChunkedEncodingError,
-            ContentDecodingError,
-            StreamConsumedError,
-            UnrewindableBodyError,
-        ) as error:
-            logger.debug(error)
-            logger.debug("Retrying...")
-            # these errors we can safely retry
-            continue
+        except KeyboardInterrupt:
+            shutdown.request_stop("KeyboardInterrupt")
+            if state_db_path:
+                requeue_in_progress_tasks(state_db_path)
+            logger.info("Run cancelled by KeyboardInterrupt")
+            return EXIT_CANCELLED
         except Exception:
             dump_responses(logger.debug, captured_responses)
             raise

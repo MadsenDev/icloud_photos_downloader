@@ -3,6 +3,7 @@ import io
 import os
 import shutil
 import sys
+import time
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from functools import partial
@@ -12,6 +13,11 @@ from vcr import VCR
 
 from foundation.core import compose, flip, partial_1_1, partial_2_1
 from icloudpd.cli import cli
+
+# Keep tests deterministic across environments that run with non-UTC local time.
+os.environ["TZ"] = "UTC"
+if hasattr(time, "tzset"):
+    time.tzset()
 
 vcr = VCR(decode_compressed_response=True, record_mode="none")
 
@@ -115,7 +121,11 @@ def assert_files(
         )
 
 
-DEFAULT_ENV: Mapping[str, str | None] = {"CLIENT_ID": "DE309E26-942E-11E8-92F5-14109FE0B321"}
+DEFAULT_ENV: Mapping[str, str | None] = {
+    "CLIENT_ID": "DE309E26-942E-11E8-92F5-14109FE0B321",
+    "HOME": "/tmp/icloudpd-tests-home",
+    "TZ": "UTC",
+}
 
 
 def clean_boolean_args(params: Sequence[str]) -> list[str]:
@@ -170,6 +180,10 @@ def run_main_env(
 ) -> TestResult:
     """Run the new argparse-based CLI with environment variables"""
 
+    home_dir = env.get("HOME")
+    if home_dir:
+        os.makedirs(home_dir, exist_ok=True)
+
     # Set environment variables
     original_env = {}
     for key, value in env.items():
@@ -179,6 +193,8 @@ def run_main_env(
                 del os.environ[key]
         else:
             os.environ[key] = value
+    if hasattr(time, "tzset"):
+        time.tzset()
 
     # Capture stdout and stderr
     stdout_capture = io.StringIO()
@@ -263,6 +279,8 @@ def run_main_env(
                     del os.environ[key]
             else:
                 os.environ[key] = original_value
+        if hasattr(time, "tzset"):
+            time.tzset()
 
     # Clean the output to remove log prefixes for compatibility with old tests
     raw_output = stdout_capture.getvalue()
@@ -278,16 +296,10 @@ def run_main_env(
     # Create both original and cleaned output
     cleaned_output = "\n".join(cleaned_lines)
 
-    # For compatibility with old tests, adjust exit codes for specific error conditions
-    adjusted_exit_code = exit_code
-    if exit_code == 1 and "Invalid email/password combination" in raw_output:
-        # Authentication failure - old tests expect exit code 2
-        adjusted_exit_code = 2
-
     # For compatibility, provide the cleaned output as the primary output
     # but keep raw_output available if needed
     result = TestResult(
-        exit_code=adjusted_exit_code,
+        exit_code=exit_code,
         output=cleaned_output,
         exception=exception,
         stderr=stderr_capture.getvalue(),

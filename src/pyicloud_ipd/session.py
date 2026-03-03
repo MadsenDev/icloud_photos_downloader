@@ -1,6 +1,9 @@
 import inspect
 import json
 import logging
+import os
+import tempfile
+import threading
 import typing
 from typing import Any, Callable, Dict, Mapping, NoReturn, Sequence
 
@@ -16,6 +19,8 @@ from pyicloud_ipd.exceptions import (
 from pyicloud_ipd.utils import handle_connection_error, throw_on_503
 
 LOGGER = logging.getLogger(__name__)
+_PATH_LOCKS: dict[str, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
 
 HEADER_DATA = {
     "X-Apple-ID-Account-Country": "account_country",
@@ -88,14 +93,12 @@ class PyiCloudSession(Session):
                 session_arg = value
                 self.service.session_data.update({session_arg: response.headers.get(header)})
 
-        # Save session_data to file
-        with open(self.service.session_path, "w", encoding="utf-8") as outfile:
-            json.dump(self.service.session_data, outfile)
-            LOGGER.debug("Saved session data to file")
-
-        # Save cookies to file
-        self.cookies.save(ignore_discard=True, ignore_expires=True)  # type: ignore[attr-defined]
-        LOGGER.debug("Cookies saved to %s", self.service.cookiejar_path)
+        persist_session_and_cookies(
+            self.service.session_path,
+            self.service.cookiejar_path,
+            self.service.session_data,
+            self.cookies,
+        )
 
         if not response.ok and (
             content_type not in json_mimetypes or response.status_code in [421, 450, 500]
@@ -174,3 +177,61 @@ class PyiCloudSession(Session):
         api_error = PyiCloudAPIResponseException(reason, code)
         LOGGER.error(api_error)
         raise api_error
+
+
+def _lock_for_path(path: str) -> threading.Lock:
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(path)
+        if lock is None:
+            lock = threading.Lock()
+            _PATH_LOCKS[path] = lock
+        return lock
+
+
+def _atomic_write_json(path: str, payload: Mapping[str, Any]) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".icloudpd-session-", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as outfile:
+            json.dump(payload, outfile)
+            outfile.flush()
+            os.fsync(outfile.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _atomic_save_cookiejar(cookiejar: Any, cookiejar_path: str) -> None:
+    directory = os.path.dirname(cookiejar_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".icloudpd-cookiejar-", dir=directory, text=True)
+    os.close(fd)
+    try:
+        cookiejar.save(
+            filename=temp_path,
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+        os.replace(temp_path, cookiejar_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def persist_session_and_cookies(
+    session_path: str, cookiejar_path: str, session_data: Mapping[str, Any], cookies: Any
+) -> None:
+    lock_paths = sorted({os.path.abspath(session_path), os.path.abspath(cookiejar_path)})
+    locks = [_lock_for_path(path) for path in lock_paths]
+    for lock in locks:
+        lock.acquire()
+    try:
+        _atomic_write_json(session_path, session_data)
+        LOGGER.debug("Saved session data to file")
+        _atomic_save_cookiejar(cookies, cookiejar_path)
+        LOGGER.debug("Cookies saved to %s", cookiejar_path)
+    finally:
+        for lock in reversed(locks):
+            lock.release()

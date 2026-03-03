@@ -219,6 +219,120 @@ This is a list of all options available for the command line interface (CLI) of 
     
 :   If specified, assets downloaded locally will be deleted in iCloud (actually moved to the Recently Deleted album). Deprecated, use [`--keep-icloud-recent-days`](keep-icloud-recent-days-parameter) instead.
 
+(skip-created-before-parameter)=
+`--skip-created-before X` / `--skip-created-after X`
+
+:   Filters assets using the original capture time (asset created date).
+
+(skip-added-before-parameter)=
+`--skip-added-before X` / `--skip-added-after X`
+
+:   Filters assets using the iCloud added date (when asset was added/synced to iCloud).
+
+Date filter behavior:
+
+- `created` filters are about when the media was taken.
+- `added` filters are about when it appeared in iCloud.
+- `--recent` and `--until-found` traversal order uses added-date ordering.
+
+(state-db-parameter)=
+`--state-db [PATH]`
+
+:   Enables persistent state DB for resumable runs. If PATH is omitted, the DB is created at `<cookie-directory>/icloudpd.sqlite`.
+
+`--state-db-prune-completed-days DAYS`
+
+:   Optional run-end retention policy. Removes `done`/`failed` task rows older than `DAYS`.
+
+`--state-db-vacuum`
+
+:   Optional run-end full `VACUUM` to reclaim SQLite file space (slower on large DBs).
+
+State DB maintenance behavior:
+
+- WAL checkpoint (`PRAGMA wal_checkpoint(PASSIVE)`) is executed automatically at run end when `--state-db` is enabled.
+- Use `--state-db-vacuum` periodically (not every run) for large databases.
+- If a download URL is expired/denied (`401`/`403`/`410`), `icloudpd` attempts one metadata URL refresh and retry.
+- Unrecoverable URL-expiry cases are marked in task state via `needs_url_refresh=1`.
+
+## Resilience and Engine Options
+
+```{versionadded} 1.33.0
+```
+
+`--log-format {text,json}`
+
+:   Selects text logs or structured JSON logs.
+
+`--metrics-json PATH`
+
+:   Writes machine-readable end-of-run metrics and summary JSON.
+
+`--max-retries N`
+
+:   Maximum transient retry attempts across metadata/download paths.
+
+`--backoff-base-seconds X`
+
+:   Base delay for exponential retry backoff.
+
+`--backoff-max-seconds X`
+
+:   Maximum delay cap for retry backoff.
+
+`--respect-retry-after` / `--no-respect-retry-after`
+
+:   Enables/disables honoring server `Retry-After` headers.
+
+`--throttle-cooldown-seconds X`
+
+:   Minimum cooldown delay used when throttling is detected.
+
+`--download-workers N`
+
+:   Download worker concurrency limit. Metadata enumeration remains single-threaded.
+
+`--download-chunk-bytes N`
+
+:   Streaming chunk size for downloads.
+
+`--verify-size` / `--no-verify-size`
+
+:   Enables/disables downloaded-size validation against metadata.
+
+`--verify-checksum` / `--no-verify-checksum`
+
+:   Enables/disables checksum validation when checksum metadata is available.
+
+`--album-page-size N`
+
+:   Album API page size used for enumeration.
+
+`--no-remote-count`
+
+:   Skips remote count queries to reduce metadata call volume.
+
+## Operational Thresholds
+
+- Repeated throttling alert: emitted when a user run records 5 or more throttle events.
+- Recommended first responses when alerts appear:
+  - lower `--download-workers` (for example, from `4` to `2`)
+  - increase `--watch-with-interval`
+  - keep `--no-remote-count` enabled to reduce metadata calls
+
+## Exit Codes
+
+- `0`: run completed (may be `partial_success` if some downloads failed; inspect run summary/metrics).
+- `1`: runtime/authentication/processing error.
+- `2`: CLI usage/validation error.
+- `130`: cancelled by `SIGINT`/`SIGTERM` with graceful shutdown.
+
+When `--metrics-json` is enabled, the output includes:
+
+- `exit_code`
+- `status` (`success`, `partial_success`, `cancelled`, `runtime_error`, `cli_error`)
+- per-user counters and throughput/error metrics (including `run_mode`: `legacy_stateless` or `stateful_engine`).
+
     ```{note}
     If remote assets were not downloaded, e.g., because they were already in local storage, they will NOT be deleted in iCloud.
     ```

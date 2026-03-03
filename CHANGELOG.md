@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.33.0 (2026-03-03)
+
+- feat: add resilient stateful engine mode with SQLite task/checkpoint persistence and resumable leases (`--state-db`)
+- feat: add unified retry/backoff configuration for metadata and downloads (`--max-retries`, backoff controls, `--respect-retry-after`)
+- feat: add bounded adaptive download concurrency and chunked streaming controls (`--download-workers`, `--download-chunk-bytes`)
+- feat: add download integrity verification controls (`--verify-size`, `--verify-checksum`) and URL-refresh retry path for expired download URLs
+- feat: add machine-readable run outputs and observability options (`--log-format json`, `--metrics-json`)
+- feat: add state DB maintenance controls (`--state-db-prune-completed-days`, `--state-db-vacuum`)
+- feat: add explicit mode contract, exit semantics, graceful cancellation/requeue behavior, and repeated-throttling alerting
+- docs: add architecture note, migration/concurrency/troubleshooting guides, and benchmark docs for workers/chunk sizing
+- test: extend integration coverage for checkpoint resume, range edge cases, shutdown behavior, mode parity, and URL refresh flows
+
 ## 1.32.2 (2025-09-01)
 
 - fix: HTTP response content not captured for authentication and non-streaming requests [#1240](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues/1240)

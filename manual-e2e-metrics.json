@@ -1,0 +1,27 @@
+{
+  "exit_code": 1,
+  "status": "runtime_error",
+  "users_total": 1,
+  "users_with_failures": 0,
+  "users": [
+    {
+      "username": "christorp@gmail.com",
+      "run_mode": "stateful_engine",
+      "started_at_epoch": 1772556744.4582224,
+      "finished_at_epoch": 1772556748.4089096,
+      "elapsed_seconds": 3.9506871700286865,
+      "assets_considered": 0,
+      "downloads_attempted": 0,
+      "downloads_succeeded": 0,
+      "downloads_failed": 0,
+      "success_gap": 0,
+      "bytes_downloaded": 0,
+      "throughput_downloads_per_sec": 0.0,
+      "retries": 0,
+      "throttle_events": 0,
+      "queue_depth_max": 0,
+      "queue_depth_last": 0,
+      "low_disk_events": 0
+    }
+  ]
+}

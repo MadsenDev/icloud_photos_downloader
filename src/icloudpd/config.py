@@ -50,6 +50,17 @@ class _DefaultConfig:
     skip_created_before: datetime.datetime | datetime.timedelta | None
     skip_created_after: datetime.datetime | datetime.timedelta | None
     skip_photos: bool
+    skip_added_before: datetime.datetime | datetime.timedelta | None = None
+    skip_added_after: datetime.datetime | datetime.timedelta | None = None
+    download_chunk_bytes: int = 262144
+    verify_size: bool = False
+    verify_checksum: bool = False
+    download_workers: int = 4
+    album_page_size: int = 100
+    no_remote_count: bool = False
+    state_db: str | None = None
+    state_db_prune_completed_days: int | None = None
+    state_db_vacuum: bool = False
 
 
 @dataclass(kw_only=True)
@@ -65,9 +76,16 @@ class GlobalConfig:
     use_os_locale: bool
     only_print_filenames: bool
     log_level: LogLevel
+    log_format: str = "text"
     no_progress_bar: bool
     threads_num: int
     domain: str
     watch_with_interval: int | None
     password_providers: Sequence[PasswordProvider]
     mfa_provider: MFAProvider
+    max_retries: int
+    backoff_base_seconds: float
+    backoff_max_seconds: float
+    respect_retry_after: bool
+    throttle_cooldown_seconds: float
+    metrics_json: str | None = None

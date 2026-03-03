@@ -138,6 +138,36 @@ class EmailNotificationsTestCase(TestCase):
             subprocess_patched.assert_called_once_with(["test_script.sh"])
 
     @freeze_time("2018-01-01")
+    def test_2sa_required_notification_script_with_state_db(self) -> None:
+        base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3], "state_db")
+        cookie_dir = os.path.join(base_dir, "cookie")
+        data_dir = os.path.join(base_dir, "data")
+
+        for dir in [base_dir, cookie_dir, data_dir]:
+            recreate_path(dir)
+
+        with patch("subprocess.call") as subprocess_patched:
+            result = run_cassette(
+                os.path.join(self.vcr_path, "auth_requires_2fa.yml"),
+                [
+                    "--username",
+                    "jdoe@gmail.com",
+                    "--password",
+                    "password1",
+                    "--notification-script",
+                    "./test_script.sh",
+                    "--state-db",
+                    "-d",
+                    data_dir,
+                    "--cookie-directory",
+                    cookie_dir,
+                ],
+            )
+            self.assertEqual(result.exit_code, 1, "exit code")
+            subprocess_patched.assert_called_once_with(["test_script.sh"])
+            self.assertTrue(os.path.exists(os.path.join(cookie_dir, "icloudpd.sqlite")))
+
+    @freeze_time("2018-01-01")
     def test_2sa_required_email_notification_from(self) -> None:
         base_dir = os.path.join(self.fixtures_path, inspect.stack()[0][3])
         cookie_dir = os.path.join(base_dir, "cookie")
