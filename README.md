@@ -11,6 +11,36 @@ See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_dow
 
 We aim to release new versions once a week (Friday), if there is something worth delivering.
 
+## New in 1.33.0 (Resilient Engine)
+
+- Unified retry + exponential backoff across metadata and downloads (`429`/`503` aware)
+- Adaptive throttling cooldown and bounded download workers (`--download-workers`)
+- Optional persistent SQLite task/checkpoint state (`--state-db`) for resumable long runs
+- Configurable streaming chunk size (`--download-chunk-bytes`)
+- Optional integrity verification (`--verify-size`, `--verify-checksum`)
+- JSON logging and run metrics export (`--log-format json`, `--metrics-json`)
+- State DB maintenance controls (`--state-db-prune-completed-days`, `--state-db-vacuum`)
+
+## Engine Modes
+
+| Mode | Best For |
+| --- | --- |
+| Classic (stateless) | Small libraries and simple one-off runs |
+| Stateful engine | Large libraries and long-running/resumable jobs |
+
+Stateful mode is enabled with `--state-db`. It stores per-asset tasks/checkpoints, supports deterministic resume after interruption, and requeues stale in-progress tasks safely on restart.
+
+Backward compatibility: if `--state-db` is not used, `icloudpd` behaves like previous stateless versions (filesystem skip-based behavior).
+
+### Key Performance and Resilience Flags
+
+- `--state-db [PATH]`
+- `--download-workers N`
+- `--max-retries N`
+- `--download-chunk-bytes N`
+- `--verify-size` / `--verify-checksum`
+- `--no-remote-count`
+
 ## iCloud Prerequisites
 
 To make iCloud Photo Downloader work, ensure the iCloud account is configured with the following settings, otherwise Apple Servers will return an ACCESS_DENIED error:
